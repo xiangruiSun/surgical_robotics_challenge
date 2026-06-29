@@ -1,19 +1,30 @@
 #!/usr/bin/env python3
-"""Collect synchronized cameraR RGB and AMBF depth data.
+"""Collect synchronized cameraR RGB and PointCloud2 depth while keeping camera fixed.
 
-AMBF publishes camera DepthData as sensor_msgs/PointCloud2. The cloud is in the
-OpenGL optical convention: +X right, +Y up, and the camera looks along -Z.
-Therefore metric optical-axis depth is -Z. OpenGL images/cloud rows also commonly
-use a bottom-left origin, while ROS/OpenCV images use a top-left origin, so the
-the XYZ samples are projected with the calibrated camera intrinsic matrix.
+This version keeps the static-camera collection behavior and revises the depth pipeline:
+- It uses a strict AMBF -> OpenGL -> intrinsic triangulation depth conversion.
+- It flips organized depth vertically after triangulation so the depth map matches ROS/OpenCV RGB image orientation.
+- It does NOT move cameraR.
+- It moves PSM1 and PSM2 with CRTK Cartesian servo_cp using POSITION ONLY.
+- PSM orientation is always copied from the cached initial pose; no rotation command is changed.
+- PSM translation follows a monotonic smooth ramp from zero offset to a tiny final x/y/z offset.
+  This avoids the initial jump caused by sinusoidal cos() motion.
+- Needle is not subscribed, commanded, held, or moved by this collector.
+- It does NOT create depth_metric_mm/.
 
-Outputs per frame:
-  image/frame_xxxxxx.png                  BGR/RGB camera image
-  depth/frame_xxxxxx.npy                  float32 metric depth in metres
-  depth/frame_xxxxxx.png                  visible 8-bit grayscale depth image
-  depth_color/frame_xxxxxx.png            visible colour-mapped depth image
-  depth_metric_mm/frame_xxxxxx.png        uint16 metric depth in millimetres
-  metadata.csv                            timestamps and conversion settings
+Outputs:
+  image/frame_xxxxxx.png
+  depth/frame_xxxxxx.npy
+  depth/frame_xxxxxx.png
+  depth_color/frame_xxxxxx.png
+  metadata.csv
+
+Run the slow 1000-frame collection:
+  python3 collect_static_camera_position_only_needle_xy_1000.py
+
+This script is tuned for slow PSM-only position motion: the PSM targets start exactly
+at their initial poses and then slowly ramp by a tiny final x/y/z displacement across
+all 1000 frames, with no commanded rotation. The needle is left untouched.
 """
 
 import argparse
@@ -30,8 +41,9 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
-from ambf_msgs.msg import CameraCmd, CameraState
+from ambf_msgs.msg import CameraState
 from cv_bridge import CvBridge
+from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import Image, PointCloud2
 from sensor_msgs_py import point_cloud2
 
@@ -40,75 +52,28 @@ def stamp_to_ns(stamp):
     return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
 
 
-def quat_from_euler(roll, pitch, yaw):
-    cy, sy = math.cos(yaw * 0.5), math.sin(yaw * 0.5)
-    cp, sp = math.cos(pitch * 0.5), math.sin(pitch * 0.5)
-    cr, sr = math.cos(roll * 0.5), math.sin(roll * 0.5)
-    q = np.array([
-        sr * cp * cy - cr * sp * sy,
-        cr * sp * cy + sr * cp * sy,
-        cr * cp * sy - sr * sp * cy,
-        cr * cp * cy + sr * sp * sy,
-    ], dtype=np.float64)
-    return q / (np.linalg.norm(q) + 1e-12)
-
-
-def quat_multiply(q1, q2):
-    x1, y1, z1, w1 = q1
-    x2, y2, z2, w2 = q2
-    return np.array([
-        w1*x2 + x1*w2 + y1*z2 - z1*y2,
-        w1*y2 - x1*z2 + y1*w2 + z1*x2,
-        w1*z2 + x1*y2 - y1*x2 + z1*w2,
-        w1*w2 - x1*x2 - y1*y2 - z1*z2,
-    ], dtype=np.float64)
-
-
 def image_msg_to_cv2(bridge, msg):
-    """Convert ROS image while respecting its declared encoding."""
-    img = bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-    return np.asarray(img)
+    return np.asarray(bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8"))
 
 
-def depth_image_to_numpy(bridge, msg):
-    """Convert a ROS depth Image to metres following REP-118 conventions."""
-    depth = np.asarray(
-        bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
-    )
-    if msg.encoding in ("16UC1", "mono16"):
-        depth_m = depth.astype(np.float32) * 0.001
-    elif msg.encoding == "32FC1":
-        depth_m = depth.astype(np.float32)
-    else:
-        raise RuntimeError(
-            f"Unsupported depth Image encoding {msg.encoding!r}; "
-            "expected 16UC1 or 32FC1."
-        )
-    depth_m[~np.isfinite(depth_m)] = 0.0
-    depth_m[depth_m <= 0.0] = 0.0
-    return depth_m
 
-
-def _read_xyz_points(msg):
-    """Read x/y/z from PointCloud2 without dropping NaNs or pixel positions."""
+def read_xyz_points(msg):
+    """Read x/y/z from PointCloud2 without dropping NaNs or changing point order."""
     field_names = {field.name for field in msg.fields}
     if not {"x", "y", "z"}.issubset(field_names):
-        raise RuntimeError(
-            f"PointCloud2 fields are {sorted(field_names)}, expected x/y/z"
-        )
+        raise RuntimeError(f"PointCloud2 fields are {sorted(field_names)}, expected x/y/z")
 
-    # read_points_numpy is the official ROS 2 path for equally typed XYZ fields.
     pts = point_cloud2.read_points_numpy(
         msg, field_names=["x", "y", "z"], skip_nans=False
     )
     pts = np.asarray(pts)
     if pts.dtype.names:
         pts = np.column_stack([pts["x"], pts["y"], pts["z"]])
-    pts = np.asarray(pts, dtype=np.float32).reshape(-1, 3)
-    return pts
+    return np.asarray(pts, dtype=np.float32).reshape(-1, 3)
 
 
-def _clean_metric_depth(depth, near_clip, far_clip):
+def clean_metric_depth(depth, near_clip, far_clip):
+    """Keep finite positive depth values in the requested metric range."""
     depth = np.asarray(depth, dtype=np.float32)
     valid = np.isfinite(depth) & (depth > float(near_clip))
     if far_clip > 0:
@@ -118,96 +83,112 @@ def _clean_metric_depth(depth, near_clip, far_clip):
     return out
 
 
-def _best_organized_depth(pts, height, width, near_clip, far_clip, flip_vertical):
-    """Use PointCloud2's image ordering directly when it has H*W points.
+# AMBF camera axes -> OpenCV camera axes, from the SRC projection example:
+#   OpenCV: +X right, +Y down, +Z forward.
+F_AMBF_TO_OPENCV = np.array([
+    [0.0, 1.0,  0.0, 0.0],
+    [0.0, 0.0, -1.0, 0.0],
+    [-1.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0,  0.0, 1.0],
+], dtype=np.float32)
 
-    An organized point cloud already has one XYZ sample per pixel. Reprojecting
-    such a cloud with K is unnecessary and can erase the whole image when the
-    producer's camera-axis convention differs. We test +Z, -Z, and Euclidean
-    range, then choose the candidate with the largest valid population.
+# OpenCV camera axes -> OpenGL camera axes:
+#   OpenCV: +X right, +Y down, +Z forward
+#   OpenGL: +X right, +Y up,   -Z forward
+# So x is unchanged, y and z are flipped.
+F_OPENCV_TO_OPENGL = np.array([
+    [1.0,  0.0,  0.0, 0.0],
+    [0.0, -1.0,  0.0, 0.0],
+    [0.0,  0.0, -1.0, 0.0],
+    [0.0,  0.0,  0.0, 1.0],
+], dtype=np.float32)
+
+# Final strict conversion used by this collector.
+F_AMBF_TO_OPENGL = F_OPENCV_TO_OPENGL @ F_AMBF_TO_OPENCV
+R_AMBF_TO_OPENGL = F_AMBF_TO_OPENGL[:3, :3]
+
+
+def ambf_points_to_opengl(pts_ambf):
+    """Convert Nx3 AMBF camera-frame points into OpenGL camera-frame points."""
+    pts_ambf = np.asarray(pts_ambf, dtype=np.float32).reshape(-1, 3)
+    return pts_ambf @ R_AMBF_TO_OPENGL.T
+
+
+def triangulated_depth_from_opengl_points(pts_gl, height, width, fx, fy, cx, cy):
+    """Compute per-pixel optical-axis depth from OpenGL camera points and K.
+
+    OpenGL camera convention:
+        +X right, +Y up, -Z forward.
+
+    For image pixel (u, v), the OpenGL camera ray from the intrinsic matrix is:
+        r = [(u - cx) / fx, -(v - cy) / fy, -1]
+
+    A point on that ray satisfies:
+        P_gl = depth * r
+
+    Therefore depth is solved by least-squares triangulation:
+        depth = dot(P_gl, r) / dot(r, r)
+
+    This uses the camera intrinsics and the pixel location instead of choosing
+    a depth convention by sign voting.
     """
-    if pts.shape[0] != int(height) * int(width):
-        return None, "not-organized", 0.0
+    h, w = int(height), int(width)
+    xyz = np.asarray(pts_gl, dtype=np.float32).reshape(h, w, 3)
 
-    xyz = pts.reshape(int(height), int(width), 3)
-    candidates = {
-        "+z": xyz[..., 2],
-        "-z": -xyz[..., 2],
-        "abs(z)": np.abs(xyz[..., 2]),
-        "range": np.linalg.norm(xyz, axis=2),
-    }
+    u = np.arange(w, dtype=np.float32)[None, :]
+    v = np.arange(h, dtype=np.float32)[:, None]
 
-    best = None
-    for name, raw in candidates.items():
-        depth = _clean_metric_depth(raw, near_clip, far_clip)
-        fraction = float(np.mean(depth > 0))
-        if best is None or fraction > best[0]:
-            best = (fraction, name, depth)
+    rx = (u - float(cx)) / float(fx)
+    ry = -(v - float(cy)) / float(fy)
+    rz = -1.0
 
-    fraction, name, depth = best
-    if flip_vertical:
-        depth = np.flipud(depth)
-    return np.ascontiguousarray(depth), f"organized:{name}", fraction
+    x = xyz[..., 0]
+    y = xyz[..., 1]
+    z = xyz[..., 2]
+
+    denom = rx * rx + ry * ry + 1.0
+    depth = (x * rx + y * ry + z * rz) / denom
+    return depth.astype(np.float32, copy=False)
 
 
-def _best_intrinsic_projection(pts, height, width, fx, fy, cx, cy,
-                               near_clip, far_clip):
-    """Fallback for unordered clouds; search axis permutations and signs.
+def project_unorganized_opengl_points_to_depth(pts_gl, height, width, fx, fy, cx, cy, near_clip, far_clip):
+    """Fallback for an unorganized cloud using the same OpenGL + K model."""
+    h, w = int(height), int(width)
+    pts_gl = np.asarray(pts_gl, dtype=np.float32).reshape(-1, 3)
+    finite = np.all(np.isfinite(pts_gl), axis=1)
+    pts_gl = pts_gl[finite]
+    if pts_gl.size == 0:
+        return np.zeros((h, w), dtype=np.float32)
 
-    This handles OpenGL (-Z forward, +Y up), ROS optical (+Z forward, +Y down),
-    and AMBF builds that publish coordinates in another camera-axis ordering.
-    """
-    finite = np.all(np.isfinite(pts), axis=1)
-    pts = pts[finite]
-    if pts.size == 0:
-        return np.zeros((height, width), np.float32), "projection:no-finite-points", 0.0
+    x = pts_gl[:, 0]
+    y = pts_gl[:, 1]
+    z = pts_gl[:, 2]
 
-    axis_names = ("x", "y", "z")
-    best = None
-    # forward axis, horizontal axis, vertical axis must be distinct.
-    for f_axis in range(3):
-        remaining = [i for i in range(3) if i != f_axis]
-        for h_axis, v_axis in (remaining, remaining[::-1]):
-            for f_sign in (1.0, -1.0):
-                d = f_sign * pts[:, f_axis]
-                base = d > float(near_clip)
-                if far_clip > 0:
-                    base &= d < float(far_clip)
-                if not np.any(base):
-                    continue
-                dv = d[base]
-                hp = pts[base, h_axis]
-                vp = pts[base, v_axis]
-                for h_sign in (1.0, -1.0):
-                    for v_sign in (1.0, -1.0):
-                        u = np.rint(float(cx) + h_sign * float(fx) * hp / dv).astype(np.int32)
-                        v = np.rint(float(cy) + v_sign * float(fy) * vp / dv).astype(np.int32)
-                        inside = ((u >= 0) & (u < int(width)) &
-                                  (v >= 0) & (v < int(height)))
-                        if not np.any(inside):
-                            continue
-                        linear = v[inside].astype(np.int64) * int(width) + u[inside].astype(np.int64)
-                        # Score unique occupied pixels, not merely point count.
-                        occupied = np.unique(linear).size
-                        score = occupied / float(int(height) * int(width))
-                        if best is None or score > best[0]:
-                            best = (score, f_axis, h_axis, v_axis,
-                                    f_sign, h_sign, v_sign,
-                                    linear, dv[inside])
+    # OpenGL forward optical-axis depth.
+    d = -z
+    valid = d > float(near_clip)
+    if far_clip > 0:
+        valid &= d < float(far_clip)
+    if not np.any(valid):
+        return np.zeros((h, w), dtype=np.float32)
 
-    if best is None:
-        return np.zeros((height, width), np.float32), "projection:no-valid-convention", 0.0
+    x = x[valid]
+    y = y[valid]
+    d = d[valid]
 
-    score, fa, ha, va, fs, hs, vs, linear, dv = best
-    flat = np.full(int(height) * int(width), np.inf, dtype=np.float32)
-    np.minimum.at(flat, linear, dv.astype(np.float32, copy=False))
-    depth = flat.reshape(int(height), int(width))
+    u = np.rint(float(cx) + float(fx) * x / d).astype(np.int32)
+    v = np.rint(float(cy) - float(fy) * y / d).astype(np.int32)
+
+    inside = (u >= 0) & (u < w) & (v >= 0) & (v < h)
+    if not np.any(inside):
+        return np.zeros((h, w), dtype=np.float32)
+
+    linear = v[inside].astype(np.int64) * w + u[inside].astype(np.int64)
+    flat = np.full(h * w, np.inf, dtype=np.float32)
+    np.minimum.at(flat, linear, d[inside].astype(np.float32, copy=False))
+    depth = flat.reshape(h, w)
     depth[~np.isfinite(depth)] = 0.0
-    method = (
-        f"projection:forward={fs:+g}{axis_names[fa]},"
-        f"u={hs:+g}{axis_names[ha]},v={vs:+g}{axis_names[va]}"
-    )
-    return np.ascontiguousarray(depth), method, float(score)
+    return depth
 
 
 def pointcloud2_to_depth(
@@ -222,59 +203,62 @@ def pointcloud2_to_depth(
     far_clip=10.0,
     flip_vertical=True,
 ):
-    """Convert AMBF PointCloud2 to a metric depth image robustly.
+    """Strict AMBF -> OpenGL -> intrinsic-triangulated depth pipeline.
 
-    Primary path: preserve organized point-cloud pixel ordering.
-    Fallback path: project an unordered cloud with K while searching camera-axis
-    permutations/signs. The function raises instead of silently saving black
-    images when no useful depth can be recovered.
+    Pipeline:
+      1. Read AMBF PointCloud2 x/y/z.
+      2. Convert AMBF camera coordinates to OpenGL camera coordinates using:
+             F_AMBF_TO_OPENGL = F_OPENCV_TO_OPENGL @ F_AMBF_TO_OPENCV
+      3. For each pixel, use K to build the OpenGL camera ray.
+      4. Solve optical-axis depth by triangulation.
+      5. Save a 2D metric depth map.
     """
-    pts = _read_xyz_points(msg)
+    pts_ambf = read_xyz_points(msg)
+    pts_gl = ambf_points_to_opengl(pts_ambf)
+
     h, w = int(expected_height), int(expected_width)
+    n_expected = h * w
 
-    depth, method, fraction = _best_organized_depth(
-        pts, h, w, near_clip, far_clip, flip_vertical
-    )
-    # Prefer direct organized conversion whenever it recovers at least 1% of
-    # pixels. It preserves the exact pixel correspondence supplied by AMBF.
-    if depth is None or fraction < 0.01:
-        depth, method, fraction = _best_intrinsic_projection(
-            pts, h, w, fx, fy, cx, cy, near_clip, far_clip
+    if pts_gl.shape[0] == n_expected:
+        raw_depth = triangulated_depth_from_opengl_points(
+            pts_gl, h, w, fx, fy, cx, cy
         )
+        # AMBF/OpenGL camera buffers are bottom-left origin while ROS/OpenCV
+        # RGB images are top-left origin. Flip organized depth vertically so
+        # depth[v, u] corresponds to the same pixel as RGB[v, u].
+        if flip_vertical:
+            raw_depth = np.flipud(raw_depth)
+        method = "organized-ambf-to-opengl-intrinsic-triangulation-flipY" if flip_vertical else "organized-ambf-to-opengl-intrinsic-triangulation-noFlip"
+    else:
+        raw_depth = project_unorganized_opengl_points_to_depth(
+            pts_gl, h, w, fx, fy, cx, cy, near_clip, far_clip
+        )
+        method = "projected-ambf-to-opengl-intrinsic-triangulation"
 
-    valid = depth > 0
-    valid_fraction = float(valid.mean())
-    xyz_min = np.nanmin(pts, axis=0) if pts.size else np.zeros(3)
-    xyz_max = np.nanmax(pts, axis=0) if pts.size else np.zeros(3)
+    depth = clean_metric_depth(raw_depth, near_clip, far_clip)
+    valid_fraction = float(np.mean(depth > 0.0))
+
+    xyz_min_ambf = np.nanmin(pts_ambf, axis=0) if pts_ambf.size else np.zeros(3)
+    xyz_max_ambf = np.nanmax(pts_ambf, axis=0) if pts_ambf.size else np.zeros(3)
+    xyz_min_gl = np.nanmin(pts_gl, axis=0) if pts_gl.size else np.zeros(3)
+    xyz_max_gl = np.nanmax(pts_gl, axis=0) if pts_gl.size else np.zeros(3)
 
     if valid_fraction < 1e-4:
         raise RuntimeError(
             "Depth conversion produced an empty image. "
-            f"method={method}, points={pts.shape[0]}, "
+            f"method={method}, valid_fraction={valid_fraction:.6f}, "
+            f"points={pts_ambf.shape[0]}, expected={n_expected}, "
             f"msg.height={msg.height}, msg.width={msg.width}, "
             f"point_step={msg.point_step}, row_step={msg.row_step}, "
-            f"xyz_min={xyz_min.tolist()}, xyz_max={xyz_max.tolist()}. "
-            "No files were saved for this frame."
+            f"ambf_xyz_min={xyz_min_ambf.tolist()}, ambf_xyz_max={xyz_max_ambf.tolist()}, "
+            f"opengl_xyz_min={xyz_min_gl.tolist()}, opengl_xyz_max={xyz_max_gl.tolist()}."
         )
 
     return np.ascontiguousarray(depth, dtype=np.float32), method
 
-def save_metric_depth_png(depth_m, path):
-    """Save lossless uint16 depth in millimetres; 0 means invalid."""
-    depth_mm = np.zeros(depth_m.shape, dtype=np.uint16)
-    valid = np.isfinite(depth_m) & (depth_m > 0.0)
-    scaled = np.rint(depth_m[valid] * 1000.0)
-    depth_mm[valid] = np.clip(scaled, 1, np.iinfo(np.uint16).max).astype(np.uint16)
-    if not cv2.imwrite(path, depth_mm):
-        raise RuntimeError(f"Failed to write depth PNG: {path}")
-
 
 def depth_to_visible_gray(depth_m):
-    """Convert metric depth to a visible uint8 image using robust per-frame scaling.
-
-    This is for inspection only. The .npy file remains the authoritative metric depth.
-    Near pixels are bright, far pixels are dark, and invalid pixels are black.
-    """
+    """Viewer-only depth PNG. .npy remains metric source of truth."""
     valid = np.isfinite(depth_m) & (depth_m > 0.0)
     gray = np.zeros(depth_m.shape, dtype=np.uint8)
     if np.any(valid):
@@ -282,12 +266,12 @@ def depth_to_visible_gray(depth_m):
         if hi <= lo:
             hi = lo + 1e-6
         normalized = np.clip((depth_m - lo) / (hi - lo), 0.0, 1.0)
+        # Same successful preview style: near bright, far dark, invalid black.
         gray[valid] = np.rint((1.0 - normalized[valid]) * 255.0).astype(np.uint8)
     return gray
 
 
 def save_visible_depth_png(depth_m, gray_path, color_path):
-    """Save depth images that ordinary image viewers display correctly."""
     gray = depth_to_visible_gray(depth_m)
     if not cv2.imwrite(gray_path, gray):
         raise RuntimeError(f"Failed to write visible depth PNG: {gray_path}")
@@ -298,9 +282,22 @@ def save_visible_depth_png(depth_m, gray_path, color_path):
         raise RuntimeError(f"Failed to write colour depth PNG: {color_path}")
 
 
-class CameraRTrainingCollector(Node):
+def copy_pose_stamped(src):
+    dst = PoseStamped()
+    dst.header = src.header
+    dst.pose.position.x = src.pose.position.x
+    dst.pose.position.y = src.pose.position.y
+    dst.pose.position.z = src.pose.position.z
+    dst.pose.orientation.x = src.pose.orientation.x
+    dst.pose.orientation.y = src.pose.orientation.y
+    dst.pose.orientation.z = src.pose.orientation.z
+    dst.pose.orientation.w = src.pose.orientation.w
+    return dst
+
+
+class StaticCameraPSMNeedleCollector(Node):
     def __init__(self, args):
-        super().__init__("cameraR_training_collector")
+        super().__init__("static_camera_psm_needle_collector")
         self.args = args
         self.bridge = CvBridge()
 
@@ -308,15 +305,18 @@ class CameraRTrainingCollector(Node):
         self.image_dir = os.path.join(self.base_dir, "image")
         self.depth_dir = os.path.join(self.base_dir, "depth")
         self.depth_color_dir = os.path.join(self.base_dir, "depth_color")
-        self.metric_png_dir = os.path.join(self.base_dir, "depth_metric_mm")
-        for directory in (
-            self.image_dir, self.depth_dir, self.depth_color_dir, self.metric_png_dir
-        ):
+        for directory in (self.image_dir, self.depth_dir, self.depth_color_dir):
             os.makedirs(directory, exist_ok=True)
 
         self.rgb_queue = deque(maxlen=args.sync_queue_size)
         self.depth_queue = deque(maxlen=args.sync_queue_size)
         self.latest_camera_state = None
+        self.latest_psm1_cp = None
+        self.latest_psm2_cp = None
+
+        self.initial_psm1_cp = None
+        self.initial_psm2_cp = None
+
         self.count = 0
         self.last_saved_rgb_stamp = None
 
@@ -334,12 +334,19 @@ class CameraRTrainingCollector(Node):
         )
 
         self.rgb_sub = self.create_subscription(Image, args.rgb_topic, self.rgb_cb, sensor_qos)
-        depth_cls = PointCloud2 if args.depth_type == "pointcloud" else Image
-        self.depth_sub = self.create_subscription(depth_cls, args.depth_topic, self.depth_cb, sensor_qos)
+        self.depth_sub = self.create_subscription(PointCloud2, args.depth_topic, self.depth_cb, sensor_qos)
         self.camera_state_sub = self.create_subscription(
             CameraState, args.camera_state_topic, self.camera_state_cb, sensor_qos
         )
-        self.camera_cmd_pub = self.create_publisher(CameraCmd, args.camera_cmd_topic, reliable_qos)
+
+        self.psm1_cp_sub = self.create_subscription(
+            PoseStamped, args.psm1_measured_cp_topic, self.psm1_cp_cb, sensor_qos
+        )
+        self.psm2_cp_sub = self.create_subscription(
+            PoseStamped, args.psm2_measured_cp_topic, self.psm2_cp_cb, sensor_qos
+        )
+        self.psm1_servo_pub = self.create_publisher(PoseStamped, args.psm1_servo_cp_topic, reliable_qos)
+        self.psm2_servo_pub = self.create_publisher(PoseStamped, args.psm2_servo_cp_topic, reliable_qos)
 
         self.metadata_path = os.path.join(self.base_dir, "metadata.csv")
         self.metadata_file = open(self.metadata_path, "w", newline="")
@@ -347,22 +354,23 @@ class CameraRTrainingCollector(Node):
         self.metadata_writer.writerow([
             "frame_id", "rgb_stamp_ns", "depth_stamp_ns", "sync_error_ms",
             "camera_stamp_ns", "rgb_file", "depth_npy_m", "depth_png_visible",
-            "depth_color_png", "depth_png_mm", "depth_source", "fx", "fy", "cx", "cy",
-            "valid_fraction",
-            "depth_method", "depth_min_m", "depth_median_m", "depth_max_m",
+            "depth_color_png", "depth_source", "fx", "fy", "cx", "cy",
+            "valid_fraction", "depth_method", "depth_min_m", "depth_median_m", "depth_max_m",
+            "psm1_x", "psm1_y", "psm1_z",
+            "psm2_x", "psm2_y", "psm2_z",
         ])
 
         self.get_logger().info(
-            f"Collecting {args.num_frames} frames into {self.base_dir}; "
-            f"max RGB-depth offset={args.max_sync_ms:.1f} ms"
+            f"Collecting {args.num_frames} static-camera frames into {self.base_dir}"
         )
         self.get_logger().info(
-            f"Depth conversion: {args.depth_type}; organized-cloud ordering first, "
-            f"intrinsic projection fallback; K=[[{args.fx},0,{args.cx}],[0,{args.fy},{args.cy}],[0,0,1]]"
+            "Camera will NOT be commanded. PSM1/PSM2 move through CRTK servo_cp with a bounded XYZ waypoint path. "
+            "PSM1/PSM2 move through CRTK servo_cp with POSITION ONLY: orientation is fixed. "
+            "Both PSMs are published continuously during each frame wait so motion is visible. "
+            "Needle is not commanded or moved by this collector."
         )
         self.get_logger().info(
-            "depth/*.png is viewer-friendly uint8; depth/*.npy is metric metres; "
-            "depth_metric_mm/*.png is uint16 millimetres."
+            "Depth conversion is strict: AMBF camera points are transformed to OpenGL coordinates, K triangulates per-pixel optical-axis depth, then organized depth is vertically flipped to match OpenCV/RGB image orientation. No depth_metric_mm output."
         )
 
     def rgb_cb(self, msg):
@@ -374,30 +382,108 @@ class CameraRTrainingCollector(Node):
     def camera_state_cb(self, msg):
         self.latest_camera_state = msg
 
+    def psm1_cp_cb(self, msg):
+        self.latest_psm1_cp = msg
+
+    def psm2_cp_cb(self, msg):
+        self.latest_psm2_cp = msg
+
     def ready(self):
-        return bool(self.rgb_queue and self.depth_queue and self.latest_camera_state is not None)
+        return (
+            bool(self.rgb_queue)
+            and bool(self.depth_queue)
+            and self.latest_camera_state is not None
+            and self.latest_psm1_cp is not None
+            and self.latest_psm2_cp is not None
+        )
 
     def wait_until_ready(self):
-        self.get_logger().info("Waiting for RGB, depth, and cameraR state...")
+        self.get_logger().info("Waiting for RGB, depth, camera state, and PSM1/PSM2 measured_cp...")
         while rclpy.ok() and not self.ready():
             rclpy.spin_once(self, timeout_sec=0.1)
-        self.get_logger().info("All required topics received.")
 
-    def publish_camera_pose(self, x, y, z, qx, qy, qz, qw):
-        cmd = CameraCmd()
-        if hasattr(cmd, "enable_position_controller"):
-            cmd.enable_position_controller = True
-        cmd.pose.position.x, cmd.pose.position.y, cmd.pose.position.z = float(x), float(y), float(z)
-        cmd.pose.orientation.x, cmd.pose.orientation.y = float(qx), float(qy)
-        cmd.pose.orientation.z, cmd.pose.orientation.w = float(qz), float(qw)
-        self.camera_cmd_pub.publish(cmd)
+        self.initial_psm1_cp = copy_pose_stamped(self.latest_psm1_cp)
+        self.initial_psm2_cp = copy_pose_stamped(self.latest_psm2_cp)
+
+        self.get_logger().info("All required topics received. Cached initial poses.")
+
+    def make_psm_target(self, initial_msg, dx, dy, dz):
+        target = copy_pose_stamped(initial_msg)
+        target.header.stamp = self.get_clock().now().to_msg()
+        target.pose.position.x = float(initial_msg.pose.position.x + dx)
+        target.pose.position.y = float(initial_msg.pose.position.y + dy)
+        target.pose.position.z = float(initial_msg.pose.position.z + dz)
+        # Orientation intentionally unchanged: position-only variation.
+        return target
+
+
+    def smoothstep(self, t):
+        """Zero-velocity start/end ramp, t in [0, 1]."""
+        t = max(0.0, min(1.0, float(t)))
+        return t * t * (3.0 - 2.0 * t)
+
+    def interpolate_waypoints(self, waypoints, t):
+        """Smoothly interpolate a bounded waypoint path without any initial jump."""
+        t = max(0.0, min(1.0, float(t)))
+        nseg = len(waypoints) - 1
+        if nseg <= 0:
+            return np.zeros(3, dtype=float)
+        scaled = t * nseg
+        idx = min(int(scaled), nseg - 1)
+        local_t = scaled - idx
+        s = self.smoothstep(local_t)
+        a = np.asarray(waypoints[idx], dtype=float)
+        b = np.asarray(waypoints[idx + 1], dtype=float)
+        return (1.0 - s) * a + s * b
+
+    def publish_scene_targets(self):
+        """Publish position-only targets for both PSMs along a bounded XYZ path.
+
+        Movement strategy:
+        - needle is not commanded at all;
+        - PSM orientation is copied from the cached initial measured_cp;
+        - PSM target starts exactly at initial pose;
+        - each arm follows x, then y, then z, then returns toward start;
+        - both PSM targets are republished during the frame wait for visible motion.
+        """
+        t = self.count / max(1.0, float(self.args.num_frames - 1))
+
+        psm1_path = [
+            (0.0, 0.0, 0.0),
+            (self.args.psm1_dx_total, 0.0, 0.0),
+            (self.args.psm1_dx_total, self.args.psm1_dy_total, 0.0),
+            (self.args.psm1_dx_total, self.args.psm1_dy_total, self.args.psm1_dz_total),
+            (0.0, 0.0, 0.0),
+        ]
+        psm2_path = [
+            (0.0, 0.0, 0.0),
+            (self.args.psm2_dx_total, 0.0, 0.0),
+            (self.args.psm2_dx_total, self.args.psm2_dy_total, 0.0),
+            (self.args.psm2_dx_total, self.args.psm2_dy_total, self.args.psm2_dz_total),
+            (0.0, 0.0, 0.0),
+        ]
+
+        psm1_dx, psm1_dy, psm1_dz = self.interpolate_waypoints(psm1_path, t)
+        psm2_dx, psm2_dy, psm2_dz = self.interpolate_waypoints(psm2_path, t)
+
+        psm1_target = self.make_psm_target(self.initial_psm1_cp, psm1_dx, psm1_dy, psm1_dz)
+        psm2_target = self.make_psm_target(self.initial_psm2_cp, psm2_dx, psm2_dy, psm2_dz)
+
+        self.psm1_servo_pub.publish(psm1_target)
+        self.psm2_servo_pub.publish(psm2_target)
+
+        return psm1_target, psm2_target
+
+    def publish_initial_scene(self):
+        psm1_target = self.make_psm_target(self.initial_psm1_cp, 0.0, 0.0, 0.0)
+        psm2_target = self.make_psm_target(self.initial_psm2_cp, 0.0, 0.0, 0.0)
+        self.psm1_servo_pub.publish(psm1_target)
+        self.psm2_servo_pub.publish(psm2_target)
 
     def closest_synchronized_pair(self):
-        """Return the newest unused RGB and the depth message nearest in time."""
         if not self.rgb_queue or not self.depth_queue:
             return None
 
-        # Work newest-to-oldest so camera motion does not pair against stale frames.
         for rgb_msg in reversed(self.rgb_queue):
             rgb_ns = stamp_to_ns(rgb_msg.header.stamp)
             if rgb_ns == self.last_saved_rgb_stamp:
@@ -412,10 +498,11 @@ class CameraRTrainingCollector(Node):
                 return rgb_msg, depth_msg, error_ms
         return None
 
-    def save_synchronized_pair(self):
+    def save_synchronized_pair(self, psm1_target, psm2_target):
         pair = self.closest_synchronized_pair()
         if pair is None:
             return False
+
         rgb_msg, depth_msg, sync_error_ms = pair
         rgb_stamp = stamp_to_ns(rgb_msg.header.stamp)
         frame_id = f"frame_{self.count:06d}"
@@ -423,44 +510,36 @@ class CameraRTrainingCollector(Node):
         rgb = image_msg_to_cv2(self.bridge, rgb_msg)
         height, width = rgb.shape[:2]
 
-        if self.args.depth_type == "pointcloud":
-            depth_m, depth_method = pointcloud2_to_depth(
-                depth_msg,
-                expected_height=height,
-                expected_width=width,
-                fx=self.args.fx,
-                fy=self.args.fy,
-                cx=self.args.cx,
-                cy=self.args.cy,
-                near_clip=self.args.near_clip,
-                far_clip=self.args.far_clip,
-                flip_vertical=self.args.flip_vertical,
-            )
-        else:
-            depth_method = "ros-depth-image"
-            depth_m = depth_image_to_numpy(self.bridge, depth_msg)
-            if depth_m.shape != (height, width):
-                raise RuntimeError(
-                    f"Depth image shape {depth_m.shape} does not match RGB {(height, width)}"
-                )
+        depth_m, depth_method = pointcloud2_to_depth(
+            depth_msg,
+            expected_height=height,
+            expected_width=width,
+            fx=self.args.fx,
+            fy=self.args.fy,
+            cx=self.args.cx,
+            cy=self.args.cy,
+            near_clip=self.args.near_clip,
+            far_clip=self.args.far_clip,
+            flip_vertical=self.args.flip_vertical,
+        )
 
         rgb_file = os.path.join(self.image_dir, f"{frame_id}.png")
         depth_npy = os.path.join(self.depth_dir, f"{frame_id}.npy")
         depth_visible_png = os.path.join(self.depth_dir, f"{frame_id}.png")
         depth_color_png = os.path.join(self.depth_color_dir, f"{frame_id}.png")
-        depth_metric_png = os.path.join(self.metric_png_dir, f"{frame_id}.png")
 
         if not cv2.imwrite(rgb_file, rgb):
             raise RuntimeError(f"Failed to write RGB image: {rgb_file}")
         np.save(depth_npy, depth_m.astype(np.float32, copy=False))
         save_visible_depth_png(depth_m, depth_visible_png, depth_color_png)
-        save_metric_depth_png(depth_m, depth_metric_png)
 
         valid = depth_m > 0.0
         if np.any(valid):
             stats = (
-                float(valid.mean()), float(depth_m[valid].min()),
-                float(np.median(depth_m[valid])), float(depth_m[valid].max()),
+                float(valid.mean()),
+                float(depth_m[valid].min()),
+                float(np.median(depth_m[valid])),
+                float(depth_m[valid].max()),
             )
         else:
             stats = (0.0, 0.0, 0.0, 0.0)
@@ -470,14 +549,33 @@ class CameraRTrainingCollector(Node):
             stamp_to_ns(camera_msg.header.stamp)
             if camera_msg is not None and hasattr(camera_msg, "header") else ""
         )
+
         self.metadata_writer.writerow([
-            frame_id, rgb_stamp, stamp_to_ns(depth_msg.header.stamp),
-            f"{sync_error_ms:.6f}", camera_stamp, rgb_file, depth_npy,
-            depth_visible_png, depth_color_png, depth_metric_png,
-            self.args.depth_type,
-            f"{self.args.fx:.12f}", f"{self.args.fy:.12f}",
-            f"{self.args.cx:.12f}", f"{self.args.cy:.12f}",
-            f"{stats[0]:.6f}", depth_method, f"{stats[1]:.6f}", f"{stats[2]:.6f}", f"{stats[3]:.6f}",
+            frame_id,
+            rgb_stamp,
+            stamp_to_ns(depth_msg.header.stamp),
+            f"{sync_error_ms:.6f}",
+            camera_stamp,
+            rgb_file,
+            depth_npy,
+            depth_visible_png,
+            depth_color_png,
+            "pointcloud",
+            f"{self.args.fx:.12f}",
+            f"{self.args.fy:.12f}",
+            f"{self.args.cx:.12f}",
+            f"{self.args.cy:.12f}",
+            f"{stats[0]:.6f}",
+            depth_method,
+            f"{stats[1]:.6f}",
+            f"{stats[2]:.6f}",
+            f"{stats[3]:.6f}",
+            f"{psm1_target.pose.position.x:.9f}",
+            f"{psm1_target.pose.position.y:.9f}",
+            f"{psm1_target.pose.position.z:.9f}",
+            f"{psm2_target.pose.position.x:.9f}",
+            f"{psm2_target.pose.position.y:.9f}",
+            f"{psm2_target.pose.position.z:.9f}",
         ])
         self.metadata_file.flush()
 
@@ -490,57 +588,41 @@ class CameraRTrainingCollector(Node):
         )
         return True
 
-    def move_and_collect(self):
+    def collect(self):
         self.wait_until_ready()
-        start_pose = self.latest_camera_state.pose
-        x0, y0, z0 = start_pose.position.x, start_pose.position.y, start_pose.position.z
-        base_q = np.array([
-            start_pose.orientation.x, start_pose.orientation.y,
-            start_pose.orientation.z, start_pose.orientation.w,
-        ], dtype=np.float64)
-        base_q /= np.linalg.norm(base_q) + 1e-12
-
         dt = 1.0 / self.args.rate_hz
         attempts_without_save = 0
 
         while rclpy.ok() and self.count < self.args.num_frames:
-            t = self.count / max(1.0, float(self.args.num_frames - 1))
-            x = x0 + self.args.move_x * t
-            y = y0 + self.args.move_y * math.sin(2.0 * math.pi * t)
-            z = z0 + self.args.move_z * math.sin(math.pi * t)
+            psm1_target, psm2_target = self.publish_scene_targets()
 
-            yaw = math.radians(self.args.yaw_deg) * math.sin(2.0 * math.pi * t)
-            pitch = math.radians(self.args.pitch_deg) * math.cos(2.0 * math.pi * t)
-            roll = math.radians(self.args.roll_deg) * math.sin(2.0 * math.pi * t)
-            q = quat_multiply(base_q, quat_from_euler(roll, pitch, yaw))
-            q /= np.linalg.norm(q) + 1e-12
-
-            for _ in range(self.args.command_repeats):
-                self.publish_camera_pose(x, y, z, *q)
-                rclpy.spin_once(self, timeout_sec=dt)
-
-            # Allow both streams to deliver samples corresponding to this pose.
+            # Allow the simulator to update. Re-publish both PSM servo_cp targets
+            # continuously during the wait; otherwise some CRTK cycles may not visibly move.
             deadline = time.monotonic() + self.args.frame_wait_sec
             saved = False
+            next_hold = 0.0
             while rclpy.ok() and time.monotonic() < deadline and not saved:
+                now = time.monotonic()
+                if now >= next_hold:
+                    self.psm1_servo_pub.publish(psm1_target)
+                    self.psm2_servo_pub.publish(psm2_target)
+                    next_hold = now + self.args.hold_publish_period
                 rclpy.spin_once(self, timeout_sec=0.01)
-                saved = self.save_synchronized_pair()
+                saved = self.save_synchronized_pair(psm1_target, psm2_target)
 
             if not saved:
                 attempts_without_save += 1
                 if attempts_without_save % 10 == 0:
-                    self.get_logger().warning(
-                        "No synchronized pair yet. Consider increasing --max_sync_ms."
-                    )
+                    self.get_logger().warning("No synchronized pair yet. Consider increasing --max_sync_ms.")
             else:
                 attempts_without_save = 0
 
             if self.args.sleep_sec > 0:
                 time.sleep(self.args.sleep_sec)
 
-        self.get_logger().info("Returning cameraR to its original pose.")
-        for _ in range(max(1, int(self.args.rate_hz))):
-            self.publish_camera_pose(x0, y0, z0, *base_q)
+        self.get_logger().info("Returning PSM1/PSM2 to cached initial poses.")
+        for _ in range(max(5, int(self.args.rate_hz))):
+            self.publish_initial_scene()
             rclpy.spin_once(self, timeout_sec=dt)
 
         self.metadata_file.close()
@@ -549,14 +631,16 @@ class CameraRTrainingCollector(Node):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out_dir", default="training_data_cameraR_depth_fixed_1000")
+    parser.add_argument("--out_dir", default="training_data_static_camera_psm_xyz_waypoint_no_needle_1000")
     parser.add_argument("--num_frames", type=int, default=1000)
 
     parser.add_argument("--rgb_topic", default="/ambf/env/cameras/cameraR/ImageData")
     parser.add_argument("--depth_topic", default="/ambf/env/cameras/cameraR/DepthData")
     parser.add_argument("--camera_state_topic", default="/ambf/env/cameras/cameraR/State")
-    parser.add_argument("--camera_cmd_topic", default="/ambf/env/cameras/cameraR/Command")
-    parser.add_argument("--depth_type", choices=["image", "pointcloud"], default="pointcloud")
+    parser.add_argument("--psm1_measured_cp_topic", default="/CRTK/psm1/measured_cp")
+    parser.add_argument("--psm2_measured_cp_topic", default="/CRTK/psm2/measured_cp")
+    parser.add_argument("--psm1_servo_cp_topic", default="/CRTK/psm1/servo_cp")
+    parser.add_argument("--psm2_servo_cp_topic", default="/CRTK/psm2/servo_cp")
 
     parser.add_argument("--fx", type=float, default=358.8070272987445)
     parser.add_argument("--fy", type=float, default=358.8070272987445)
@@ -565,29 +649,32 @@ def main():
     parser.add_argument("--near_clip", type=float, default=0.001)
     parser.add_argument("--far_clip", type=float, default=10.0)
     parser.add_argument(
-        "--no_flip_vertical", dest="flip_vertical", action="store_false",
-        help="Disable the default OpenGL-bottom-left to OpenCV-top-left row flip."
+        "--no_flip_vertical",
+        dest="flip_vertical",
+        action="store_false",
+        help="Disable vertical flip after organized depth triangulation.",
     )
     parser.set_defaults(flip_vertical=True)
+    # Position-only motion. These are TOTAL offsets reached only at the end of 1000 frames.
+    # The target starts at zero offset and uses smoothstep, so the first frame does not jump.
+    parser.add_argument("--psm1_dx_total", type=float, default=-0.01000)
+    parser.add_argument("--psm1_dy_total", type=float, default=0.00600)
+    parser.add_argument("--psm1_dz_total", type=float, default=0.00400)
+    parser.add_argument("--psm2_dx_total", type=float, default=0.01000)
+    parser.add_argument("--psm2_dy_total", type=float, default=-0.00600)
+    parser.add_argument("--psm2_dz_total", type=float, default=0.00400)
+    parser.add_argument("--rate_hz", type=float, default=20.0)
+    parser.add_argument("--hold_publish_period", type=float, default=0.02)
+    parser.add_argument("--frame_wait_sec", type=float, default=0.30)
+    parser.add_argument("--sleep_sec", type=float, default=0.01)
     parser.add_argument("--max_sync_ms", type=float, default=20.0)
     parser.add_argument("--sync_queue_size", type=int, default=60)
-    parser.add_argument("--frame_wait_sec", type=float, default=0.25)
-
-    parser.add_argument("--move_x", type=float, default=-0.02)
-    parser.add_argument("--move_y", type=float, default=0.01)
-    parser.add_argument("--move_z", type=float, default=0.005)
-    parser.add_argument("--yaw_deg", type=float, default=5.0)
-    parser.add_argument("--pitch_deg", type=float, default=3.0)
-    parser.add_argument("--roll_deg", type=float, default=0.0)
-    parser.add_argument("--rate_hz", type=float, default=30.0)
-    parser.add_argument("--command_repeats", type=int, default=3)
-    parser.add_argument("--sleep_sec", type=float, default=0.02)
     args = parser.parse_args()
 
     rclpy.init()
-    node = CameraRTrainingCollector(args)
+    node = StaticCameraPSMNeedleCollector(args)
     try:
-        node.move_and_collect()
+        node.collect()
     except KeyboardInterrupt:
         node.get_logger().warning("Collection interrupted by user.")
     finally:
